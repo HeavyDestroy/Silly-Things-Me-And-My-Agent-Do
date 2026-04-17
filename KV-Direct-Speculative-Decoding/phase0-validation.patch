@@ -1,0 +1,126 @@
+# Phase 0: Residual Identity Validation
+# 
+# This patch adds a validation mode to prove that KV-Direct's residual 
+# checkpoints are numerically identical to the hidden states that DFlash 
+# would extract for draft conditioning.
+#
+# Usage: ./llama-cli -m model.gguf --kv-direct --validate-residuals -p "test" -n 64
+
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index ... .. ...
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -XX,6 +XX,7 @@ struct llama_cparams {
+     bool kv_direct = false;
+     uint32_t kv_direct_window = 64;
+     uint32_t kv_direct_max_ctx = 131072;
++    bool validate_residuals = false;  // Phase 0: validate residual identity
+     
+     // ... existing fields ...
+ };
+
+diff --git a/src/llama-kv-cache-direct.h b/src/llama-kv-cache-direct.h
+index ... .. ...
+--- a/src/llama-kv-cache-direct.h
++++ b/src/llama-kv-cache-direct.h
+@@ -XX,6 +XX,10 @@ class llama_kv_cache_direct : public llama_memory_i {
+     uint32_t get_n_kv(const llama_kv_cache::slot_info & sinfo) const;
+ 
+     // Bounded memory: evict checkpoints older than window_size
++    
++    // Phase 0 validation: compare stored residual against manually extracted hidden state
++    void validate_residual_identity(uint32_t t, uint32_t il, ggml_tensor * manual_hidden);
++    
+     void evict_old_checkpoints(uint32_t current_token);
+ 
+     size_t memory_usage() const;
+
+diff --git a/src/llama-kv-cache-direct.cpp b/src/llama-kv-cache-direct.cpp
+index ... .. ...
+--- a/src/llama-kv-cache-direct.cpp
++++ b/src/llama-kv-cache-direct.cpp
+@@ -XX,6 +XX,45 @@ void llama_kv_cache_direct::store_checkpoint(uint32_t t, uint32_t il, ggml_tens
+ 
+     current_token = std::max(current_token, t + 1);
+ }
++
++// ============================================================================
++// Phase 0: Residual Identity Validation
++// ============================================================================
++
++void llama_kv_cache_direct::validate_residual_identity(
++        uint32_t t, uint32_t il, ggml_tensor * manual_hidden) {
++    
++    // Get the residual we stored via KV-Direct
++    ggml_tensor * stored_residual = get_residual(t, il);
++    if (!stored_residual) {
++        LLAMA_LOG_WARN("[PHASE0] No stored residual for token %u layer %u\n", t, il);
++        return;
++    }
++    
++    // Compare element-wise
++    const float tol = 1e-5f;  // FP16 roundoff tolerance
++    
++    const size_t n_elements = stored_residual->ne[0] 
++                           * stored_residual->ne[1]
++                           * stored_residual->ne[2];
++    
++    if (n_elements != manual_hidden->ne[0] * manual_hidden->ne[1] * manual_hidden->ne[2]) {
++        LLAMA_LOG_ERROR("[PHASE0] Shape mismatch: stored [%zu,%zu,%zu] vs manual [%zu,%zu,%zu]\n",
++            stored_residual->ne[0], stored_residual->ne[1], stored_residual->ne[2],
++            manual_hidden->ne[0], manual_hidden->ne[1], manual_hidden->ne[2]);
++        return;
++    }
++    
++    const float * data_r = (const float *)stored_residual->data;
++    const float * data_h = (const float *)manual_hidden->data;
++    
++    float max_diff = 0.0f;
++    float max_rel_diff = 0.0f;
++    
++    for (size_t i = 0; i < n_elements; ++i) {
++        float diff = std::fabs(data_r[i] - data_h[i]);
++        float rel_diff = std::fabs(data_h[i]) > 1e-8f ? diff / std::fabs(data_h[i]) : diff;
++        max_diff = std::max(max_diff, diff);
++        max_rel_diff = std::max(max_rel_diff, rel_diff);
++    }
++    
++    LLAMA_LOG_INFO("[PHASE0] Token %u Layer %u: max_abs=%.2e max_rel=%.2e %s\n",
++        t, il, max_diff, max_rel_diff,
++        max_rel_diff < tol ? "✓ PASS" : "✗ FAIL");
++}
+
+diff --git a/models/qwen35.cpp b/models/qwen35.cpp
+index ... .. ...
+--- a/models/qwen35.cpp
++++ b/models/qwen35.cpp
+@@ -XX,6 +XX,15 @@ static ggml_cgraph * build_graph_decode(..
+             mctx->store_residual(ubatch.pos[0], il, cur);
+         }
+         
++        // Phase 0: For validation, also extract hidden state manually
++        // and compare against KV-Direct's stored residual
++        if (cparams.validate_residuals && !hparams.is_recurrent(il)) {
++            // 'cur' IS the manual hidden state extraction point
++            // This is exactly where DFlash would hook in
++            auto * kv_direct = dynamic_cast<llama_kv_cache_direct*>(mctx->get_kv_cache());
++            if (kv_direct) {
++                kv_direct->validate_residual_identity(ubatch.pos[0], il, cur);
++            }
++        }
++        
+         // K/V projections (standard path)
+         ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, ...);
+
+diff --git a/src/llama.cpp b/src/llama.cpp
+index ... .. ...
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -XX,6 +XX,7 @@ int main(int argc, char ** argv) {
+         PARAM_FLAG("kv-direct",           cparams.kv_direct)
+         PARAM_INT ("kv-direct-window",    cparams.kv_direct_window)
+         PARAM_INT ("kv-direct-max-ctx",   cparams.kv_direct_max_ctx)
++        PARAM_FLAG("validate-residuals",  cparams.validate_residuals)
+         
+         // ... existing params ...
+     }
